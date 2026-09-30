@@ -1,0 +1,159 @@
+# 上游 workbuddy2api 镜像：用 GitHub Actions 构建并推到你自己的 GHCR。
+#
+# 上游原仓库 github.com/Sliverkiss/workbuddy2api 已被作者删除，源码只随
+# ithtelab/workbuddy-manager 的 Release 分发（固定 tag：upstream-src）。
+# 所以本工作流**不把上游源码提交进仓库**，而是构建时下载源码包，解包后用它自带的
+# Dockerfile 构建 —— 既符合上游维护者「不要把上游代码提交进仓库」的要求，也能跟随
+# 上游包更新。许可为 MIT：再分发请保留包内 LICENSE 与版权声明；上游维护者另外要求
+# 不要另开**公开**镜像，所以仓库与包建议保持 private。
+#
+# 用法：把本文件放到自己仓库的 .github/workflows/ 下，push 或手动触发即可。
+#   完成后拉取： docker pull ghcr.io/<你的用户名>/workbuddy2api-multiarch:latest
+#
+# 平台默认只出 linux/amd64。要 arm64 就在手动触发时填 linux/amd64,linux/arm64 ——
+# 上游 Dockerfile 在构建阶段直接 go build，arm64 要靠 QEMU 模拟，会明显变慢。
+
+name: Build Upstream Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_src_url:
+        description: 上游源码包地址（默认取官方 upstream-src 载体 Release）
+        required: false
+        default: https://github.com/ithtelab/workbuddy-manager/releases/download/upstream-src/workbuddy2api-src.tar.gz
+      platforms:
+        description: 目标平台，多架构用逗号分隔（arm64 走 QEMU，很慢）
+        required: false
+        default: linux/amd64
+  push:
+    paths:
+      - .github/workflows/build-upstream-image.yml
+
+# 连续触发时排队而不是互相打断：两次运行同时推 latest 会说不清指向谁。
+concurrency:
+  group: build-upstream-image-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  # 推镜像到 GHCR 必须显式声明；只给 contents 会被拒。
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 下载上游源码包并校验结构
+        id: src
+        env:
+          SRC_URL: ${{ inputs.upstream_src_url || 'https://github.com/ithtelab/workbuddy-manager/releases/download/upstream-src/workbuddy2api-src.tar.gz' }}
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors \
+            "$SRC_URL" -o "$RUNNER_TEMP/upstream-src.tar.gz"
+          SHA="$(sha256sum "$RUNNER_TEMP/upstream-src.tar.gz" | cut -d' ' -f1)"
+          echo "源码包 sha256: $SHA"
+          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+          mkdir -p "$GITHUB_WORKSPACE/ctx"
+          tar -xzf "$RUNNER_TEMP/upstream-src.tar.gz" -C "$GITHUB_WORKSPACE/ctx"
+          # 包里顶层固定是 workbuddy2api/，自带 Dockerfile / LICENSE。包换形状时要在
+          # 这里失败，而不是在构建中途报看不懂的错。
+          for f in Dockerfile docker-compose.yml go.mod LICENSE config.example.json; do
+            test -f "$GITHUB_WORKSPACE/ctx/workbuddy2api/$f" || {
+              echo "源码包结构不符合预期：缺少 workbuddy2api/$f" >&2; exit 1; }
+          done
+          echo "源码包结构校验通过"
+          grep -m1 '^打包时间' "$GITHUB_WORKSPACE/ctx/workbuddy2api/UPSTREAM-SRC.txt" || true
+
+      - name: 解析镜像名与标签
+        id: image
+        run: |
+          set -euo pipefail
+          # GHCR 要求镜像名全小写，而用户名可能含大写 —— 这行小写转换不能省。
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER}/workbuddy2api-multiarch"
+          IMAGE="${IMAGE,,}"
+          SHORT="${GITHUB_SHA::7}"
+          {
+            echo "name=$IMAGE"
+            echo "short=$SHORT"
+          } >> "$GITHUB_OUTPUT"
+          echo "本次将推送：${IMAGE}:latest 与 ${IMAGE}:sha-${SHORT}"
+
+      - name: 设置 QEMU
+        if: ${{ contains(inputs.platforms || 'linux/amd64', 'arm64') }}
+        uses: docker/setup-qemu-action@v3
+
+      - name: 设置 Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 构建并推送
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          # 上下文就是解包出来的上游源码目录：它的 Dockerfile 是
+          # COPY go.mod ./ → go mod download → COPY . .，上下文必须是该目录本身。
+          context: ctx/workbuddy2api
+          file: ctx/workbuddy2api/Dockerfile
+          platforms: ${{ inputs.platforms || 'linux/amd64' }}
+          push: true
+          labels: |
+            org.opencontainers.image.title=workbuddy2api (upstream snapshot)
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=MIT
+            io.workbuddy.upstream.src.sha256=${{ steps.src.outputs.sha256 }}
+          tags: |
+            ${{ steps.image.outputs.name }}:latest
+            ${{ steps.image.outputs.name }}:sha-${{ steps.image.outputs.short }}
+          # 关掉 provenance：它会在 manifest list 里塞 attestation 条目，某些旧版
+          # Docker 拉取时报 unknown/unknown platform。
+          provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 验证镜像内容（仅单平台时）
+        if: ${{ !contains(inputs.platforms || 'linux/amd64', ',') }}
+        env:
+          IMG: ${{ steps.image.outputs.name }}:sha-${{ steps.image.outputs.short }}
+        run: |
+          set -euo pipefail
+          docker pull "$IMG"
+          # 只查文件在不在、能不能执行。不要在这里真跑 wb2api：没有有效 config.json
+          # 时它会占着前台，CI 会卡住。
+          docker run --rm --entrypoint sh "$IMG" -c '
+            set -e
+            test -x /app/wb2api
+            for f in /app/login.sh /app/credit.sh /app/config.json \
+                     /app/scripts/task_runner.py /app/scripts/global_region.py; do
+              test -e "$f" || { echo "缺少 $f" >&2; exit 1; }
+            done
+            echo "镜像内容校验通过"'
+
+      - name: 输出结果
+        run: |
+          IMG="${{ steps.image.outputs.name }}"
+          {
+            echo "## 上游镜像已推送"
+            echo ""
+            echo "拉取（原样复制即可）："
+            echo ""
+            echo '```bash'
+            echo "docker pull ${IMG}:latest"
+            echo '```'
+            echo ""
+            echo "固定指针：\`${IMG}:sha-${{ steps.image.outputs.short }}\`"
+            echo ""
+            echo "平台：\`${{ inputs.platforms || 'linux/amd64' }}\`"
+            echo ""
+            echo "digest：\`${{ steps.build.outputs.digest }}\`"
+            echo ""
+            echo "上游源码包 sha256：\`${{ steps.src.outputs.sha256 }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
